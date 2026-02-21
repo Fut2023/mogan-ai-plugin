@@ -23,7 +23,7 @@
 (define ai-ollama-url "http://localhost:11434/api/generate")
 
 ;; Claude API settings
-(define ai-claude-api-key "")  ;; Set your API key here: sk-ant-api03-...  ;; Set your API key here: sk-ant-api03-...
+(define ai-claude-api-key "")  ;; Set your API key here: sk-ant-api03-...
 (define ai-claude-url "https://api.anthropic.com/v1/messages")
 (define ai-claude-model "claude-sonnet-4-20250514")
 (define ai-always-use-context #f)
@@ -66,32 +66,8 @@
 
 (define (ai-strip-markdown text)
   (let* ((result text)
-         ;; Remove markdown headers ## and ###
-         (result (string-replace result "### " "\\textbf{"))
-         (result (string-replace result "## " "\\textbf{"))
-         (result (string-replace result "# " "\\textbf{"))
-         ;; Convert **bold** to \textbf{bold} - replace pairs
-         (result (ai-replace-bold-pairs result))
-         ;; Remove remaining unpaired asterisks
-         (result (string-replace result "**" ""))
-         ;; Convert markdown bullet points
-         (result (string-replace result "\n- " "\n$\\bullet$ "))
-         (result (string-replace result "\n* " "\n$\\bullet$ ")))
+         (result (string-replace result "**" "")))
     result))
-
-(define (ai-replace-bold-pairs text)
-  ;; Replace **text** with \textbf{text}
-  (let ((pos (string-search-forwards "**" 0 text)))
-    (if (< pos 0)
-        text
-        (let ((end (string-search-forwards "**" (+ pos 2) text)))
-          (if (< end 0)
-              text
-              (let* ((before (substring text 0 pos))
-                     (bold-content (substring text (+ pos 2) end))
-                     (after (substring text (+ end 2) (string-length text))))
-                (ai-replace-bold-pairs
-                 (string-append before "\\textbf{" bold-content "}" after))))))))
 
 (define (ai-escape-latex text)
   ;; Escape special LaTeX characters (unused - Claude formats in LaTeX)
@@ -138,35 +114,20 @@
                (end (string-search-forwards "\"" 0 after)))
           (when (>= end 0)
             (set! result (cons (cons "path" (substring after 0 end)) result))))))
-    ;; Extract answer field (handle both "answer":"" and "answer": "")
-    (let* ((answer-pos1 (string-search-forwards "\"answer\":\"" 0 json-str))
-           (answer-pos2 (string-search-forwards "\"answer\": \"" 0 json-str))
-           (answer-pos (cond ((>= answer-pos1 0) answer-pos1)
-                             ((>= answer-pos2 0) answer-pos2)
-                             (else -1)))
-           (offset (cond ((>= answer-pos1 0) 10)
-                         ((>= answer-pos2 0) 11)
-                         (else 0))))
+    ;; Extract answer field
+    (let ((answer-pos (string-search-forwards "\"answer\":\"" 0 json-str)))
       (when (>= answer-pos 0)
-        (let* ((start (+ answer-pos offset))
+        (let* ((start (+ answer-pos 10))
                (after (substring json-str start (string-length json-str)))
-               ;; Search backwards for "} to find the real end (content may contain "} patterns)
-               (end (string-search-backwards "\"}" (string-length after) after)))
+               (end (string-search-forwards "\"}" 0 after)))
           (when (>= end 0)
             (set! result (cons (cons "answer" (unescape-json-string (substring after 0 end))) result))))))
-    ;; Extract error field (handle both "error":"" and "error": "")
-    (let* ((error-pos1 (string-search-forwards "\"error\":\"" 0 json-str))
-           (error-pos2 (string-search-forwards "\"error\": \"" 0 json-str))
-           (error-pos (cond ((>= error-pos1 0) error-pos1)
-                            ((>= error-pos2 0) error-pos2)
-                            (else -1)))
-           (err-offset (cond ((>= error-pos1 0) 9)
-                             ((>= error-pos2 0) 10)
-                             (else 0))))
+    ;; Extract error field
+    (let ((error-pos (string-search-forwards "\"error\":\"" 0 json-str)))
       (when (>= error-pos 0)
-        (let* ((start (+ error-pos err-offset))
+        (let* ((start (+ error-pos 9))
                (after (substring json-str start (string-length json-str)))
-               (end (string-search-backwards "\"}" (string-length after) after)))
+               (end (string-search-forwards "\"}" 0 after)))
           (when (>= end 0)
             (set! result (cons (cons "error" (substring after 0 end)) result))))))
     result))
@@ -612,11 +573,8 @@
                   "sync\n")
    (unix->url "/tmp/mogan-ai-pick.sh"))
   (system "/bin/bash /tmp/mogan-ai-pick.sh")
-  ;; Small delay to ensure file is flushed
   (system "sleep 0.1")
-  ;; Try multiple ways to read
-  (let ((result (var-eval-system "cat /tmp/mogan-ai-pick-result.txt 2>/dev/null")))
-    (string-save (string-append "RESULT: [" (or result "NULL") "]") (unix->url "/tmp/mogan-pdf-debug2.txt"))
+  (let ((result (var-eval-system "cat /tmp/mogan-ai-pick-result.txt")))
     (if (and result (> (string-length result) 0))
         (begin
           (set! ai-loaded-pdf-path result)
@@ -642,7 +600,6 @@
                    (config-file "/tmp/mogan-ai-pdf-config.json")
                    (script-file "/tmp/mogan-ai-pdf-query.sh")
                    (output-file "/tmp/mogan-ai-pdf-output.txt"))
-              ;; Write config JSON
               (string-save
                (string-append "{\"provider\":\"claude\""
                               ",\"question\":\"" (json-escape-string question) "\""
@@ -650,7 +607,6 @@
                               ",\"api_key\":\"" ai-claude-api-key "\""
                               "}")
                (unix->url config-file))
-              ;; Write bash script
               (string-save
                (string-append "#!/bin/bash\n"
                  "rm -f \"" output-file "\"\n"
@@ -662,13 +618,9 @@
                  "python3 \"$HELPER\" \"$CONFIG\" > \"" output-file "\" 2>&1\n"
                  "sync\n")
                (unix->url script-file))
-              ;; Run with system (blocks properly) not eval-system
               (system (string-append "/bin/bash " script-file))
               (system "sleep 0.1")
-              ;; Read result with var-eval-system cat
               (let ((result (var-eval-system (string-append "cat " output-file))))
-                (string-save (string-append "PDF QUERY: [" (or result "NULL") "]")
-                             (unix->url "/tmp/mogan-pdf-query-debug.txt"))
                 (if (and result (> (string-length result) 0))
                     (let ((json (parse-json-simple result)))
                       (if (assoc "answer" json)
@@ -678,12 +630,86 @@
                           (let ((err (assoc "error" json)))
                             (set-message (string-append "Error: " (if err (cdr err) "Unknown")) "AI"))))
                     (set-message "Error: No response from Claude about PDF" "AI"))))))))
+
 (tm-define (ai-ask-pdf-interactive)
   (:synopsis "Ask Claude about the loaded PDF")
   (interactive (lambda (q)
     (when (and q (> (string-length q) 0))
       (ai-ask-claude-about-pdf q)))
     (list "Ask about PDF" "string" '())))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; PDF to LaTeX conversion
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(define (ai-convert-pdf-to-latex)
+  (if (or (not ai-loaded-pdf-path) (string=? ai-loaded-pdf-path ""))
+      (set-message "Error: No PDF loaded. Use 'Load PDF' first." "AI")
+      (if (or (not ai-claude-api-key) (string=? ai-claude-api-key ""))
+          (set-message "Error: Claude API key not set" "AI")
+          (begin
+            (set-message "Converting PDF to LaTeX (this may take several minutes)..." "AI")
+            (let* ((helper-src (string-append (getenv "HOME")
+                                 "/Library/Application Support/moganlab/plugins/ai/bin/ai-helper.py"))
+                   (helper-src-linux (string-append (getenv "HOME")
+                                       "/.TeXmacs/plugins/ai/bin/ai-helper.py"))
+                   (config-file "/tmp/mogan-ai-pdf-config.json")
+                   (script-file "/tmp/mogan-ai-pdf-convert.sh")
+                   (json-output "/tmp/mogan-ai-pdf-convert-output.txt")
+                   (tex-file "/tmp/PDF-to-LaTeX.tex")
+                   (status-file "/tmp/mogan-ai-convert-status.txt")
+                   (question "Convert this entire PDF document to LaTeX source code. Reproduce ALL content as faithfully as possible including: text, section structure, equations, tables, theorem environments, references, and formatting. For charts and figures, describe them in comments. Output ONLY the LaTeX code starting from \\documentclass, with no explanation before or after. Use appropriate packages (amsmath, amssymb, amsthm, etc). Include \\usepackage[utf8]{inputenc} for proper encoding."))
+              (string-save
+               (string-append "{\"provider\":\"claude\""
+                              ",\"question\":\"" (json-escape-string question) "\""
+                              ",\"pdf_path\":\"" (json-escape-string ai-loaded-pdf-path) "\""
+                              ",\"api_key\":\"" ai-claude-api-key "\""
+                              "}")
+               (unix->url config-file))
+              (string-save
+               (string-append "#!/bin/bash\n"
+                 "rm -f " json-output " " tex-file " " status-file "\n"
+                 "HELPER=\"" helper-src "\"\n"
+                 "if [ ! -f \"$HELPER\" ]; then\n"
+                 "  HELPER=\"" helper-src-linux "\"\n"
+                 "fi\n"
+                 "CONFIG=$(cat " config-file ")\n"
+                 "python3 \"$HELPER\" \"$CONFIG\" > " json-output " 2>&1\n"
+                 "python3 -c '\n"
+                 "import json, re\n"
+                 "with open(\"" json-output "\", encoding=\"utf-8\") as f:\n"
+                 "    data = json.load(f)\n"
+                 "if data.get(\"success\") and \"answer\" in data:\n"
+                 "    text = data[\"answer\"]\n"
+                 "    text = text.replace(\"**\", \"\")\n"
+                 "    text = re.sub(r\"(?<=[A-Za-z])\\*(?=[A-Za-z])\", \"\", text)\n"
+                 "    with open(\"" tex-file "\", \"w\", encoding=\"utf-8\") as f:\n"
+                 "        f.write(text)\n"
+                 "    if data.get(\"truncated\"):\n"
+                 "        print(\"TRUNCATED\")\n"
+                 "    else:\n"
+                 "        print(\"OK\")\n"
+                 "else:\n"
+                 "    print(data.get(\"error\", \"Unknown error\"))\n"
+                 "' > " status-file " 2>&1\n"
+                 "sync\n")
+               (unix->url script-file))
+              (system (string-append "/bin/bash " script-file))
+              (system "sleep 0.1")
+              (let ((status (var-eval-system (string-append "cat " status-file))))
+                (if (and status (string=? status "OK"))
+                    (begin
+                      (set-message (string-append "LaTeX saved to " tex-file) "AI")
+                      (load-buffer (unix->url tex-file)))
+                    (if (and status (string=? status "TRUNCATED"))
+                        (begin
+                          (set-message "Warning: Output truncated due to document size. LaTeX file is incomplete." "AI")
+                          (load-buffer (unix->url tex-file)))
+                        (set-message (string-append "Conversion error: " (or status "Unknown")) "AI")))))))))
+
+(tm-define (ai-convert-pdf-interactive)
+  (:synopsis "Convert loaded PDF to LaTeX")
+  (ai-convert-pdf-to-latex))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Menu
@@ -698,6 +724,7 @@
   ---
   ("Load PDF..." (ai-load-pdf-interactive))
   ("Ask about PDF..." (ai-ask-pdf-interactive))
+  ("Convert PDF to LaTeX" (ai-convert-pdf-interactive))
   ---
   ("Help with Mogan..." (ai-help-mogan-interactive))
   ---

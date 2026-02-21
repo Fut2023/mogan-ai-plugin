@@ -76,30 +76,33 @@ def call_claude(question, pdf_path=None, api_key=None):
 
     data = {
         'model': 'claude-sonnet-4-20250514',
-        'max_tokens': 4096,
+        'max_tokens': 16384,
         'system': (
             'Your response will be rendered in a LaTeX document. '
             'You MUST follow these rules strictly:\n'
             '1) Use LaTeX formatting ONLY. NEVER use markdown syntax.\n'
-            '2) For bold text use \\textbf{text}, NEVER use **text**.\n'
+            '2) For bold text use \\textbf{text}, NEVER use **text** or *text*.\n'
             '3) For italic text use \\textit{text}, NEVER use *text*.\n'
-            '4) For section headers use \\textbf{Title}\\newline, NEVER use ## or #.\n'
-            '5) For inline math use $expression$, for display math use $$expression$$.\n'
-            '6) Use \\sqrt{}, \\frac{}{}, ^{}, _{} for math notation.\n'
-            '7) For bullet lists use \\begin{itemize}\\item...\\end{itemize}.\n'
-            '8) For numbered lists use \\begin{enumerate}\\item...\\end{enumerate}.\n'
-            '9) NEVER use asterisks *, **, or markdown headers #, ##, ###.\n'
-            '10) NEVER use Unicode superscripts or subscripts - use LaTeX math mode instead.'
+            '4) NEVER use asterisks (*) anywhere in your output for any purpose.\n'
+            '5) For section headers use \\section{}, \\subsection{}, NEVER use ## or #.\n'
+            '6) For inline math use $expression$, for display math use $$expression$$ or \\begin{equation}.\n'
+            '7) Use \\sqrt{}, \\frac{}{}, ^{}, _{} for math notation.\n'
+            '8) For bullet lists use \\begin{itemize}\\item...\\end{itemize}.\n'
+            '9) For numbered lists use \\begin{enumerate}\\item...\\end{enumerate}.\n'
+            '10) NEVER use Unicode superscripts or subscripts - use LaTeX math mode instead.\n'
+            '11) Write plain author names without any formatting characters between letters.'
         ),
         'messages': [{'role': 'user', 'content': content}]
     }
 
-    response = requests.post(url, headers=headers, json=data, timeout=120)
+    response = requests.post(url, headers=headers, json=data, timeout=600)
     response.raise_for_status()
 
     result = response.json()
     if 'content' in result and len(result['content']) > 0:
-        return result['content'][0]['text']
+        text = result['content'][0]['text']
+        truncated = result.get('stop_reason') == 'max_tokens'
+        return text, truncated
     else:
         raise ValueError("No content in Claude response")
 
@@ -116,13 +119,13 @@ def main():
         print(json.dumps({
             'success': False,
             'error': 'Usage: ai-helper.py pick_file | ai-helper.py \'{"provider": "claude", ...}\''
-        }))
+        }, separators=(',', ':')))
         sys.exit(1)
 
     # Check for special commands
     if sys.argv[1] == 'pick_file':
         result = pick_file()
-        print(json.dumps(result))
+        print(json.dumps(result, separators=(',', ':')))
         sys.exit(0 if result.get('success') else 1)
 
     try:
@@ -139,20 +142,24 @@ def main():
 
         # Call appropriate provider
         if provider == 'claude':
-            answer = call_claude(question, pdf_path, api_key)
+            answer, truncated = call_claude(question, pdf_path, api_key)
         elif provider == 'gemini':
             answer = call_gemini(question, pdf_path, api_key)
+            truncated = False
         else:
             raise ValueError(f'Unknown provider: {provider}')
 
         # Output success response
-        print(json.dumps({'success': True, 'answer': answer}))
+        result = {'success': True, 'answer': answer}
+        if truncated:
+            result['truncated'] = True
+        print(json.dumps(result, separators=(',', ':')))
 
     except json.JSONDecodeError as e:
-        print(json.dumps({'success': False, 'error': f'Invalid JSON: {str(e)}'}))
+        print(json.dumps({'success': False, 'error': f'Invalid JSON: {str(e)}'}, separators=(',', ':')))
         sys.exit(1)
     except Exception as e:
-        print(json.dumps({'success': False, 'error': str(e)}))
+        print(json.dumps({'success': False, 'error': str(e)}, separators=(',', ':')))
         sys.exit(1)
 
 
