@@ -32,6 +32,25 @@
 (define ai-python-helper-tmp "/tmp/mogan-ai-helper.py")
 (define ai-helper-ready #f)
 
+;; OpenAI API settings
+(define ai-openai-api-key "")  ;; Set your API key here: sk-...
+
+;; Gemini API settings
+(define ai-gemini-api-key "")  ;; Set your API key here: AIza...
+
+;; Grok (xAI) API settings
+(define ai-grok-api-key "")  ;; Set your API key here: xai-...
+
+;; PDF conversion provider: "claude", "openai", "gemini", or "grok"
+(define ai-pdf-provider "claude")
+
+(define (ai-get-pdf-api-key)
+  (cond ((string=? ai-pdf-provider "claude") ai-claude-api-key)
+        ((string=? ai-pdf-provider "openai") ai-openai-api-key)
+        ((string=? ai-pdf-provider "gemini") ai-gemini-api-key)
+        ((string=? ai-pdf-provider "grok") ai-grok-api-key)
+        (else ai-claude-api-key)))
+
 ;; Common settings
 (define ai-request-timeout 120)
 (define ai-max-retries 3)
@@ -589,10 +608,10 @@
 (define (ai-ask-claude-about-pdf question)
   (if (or (not ai-loaded-pdf-path) (string=? ai-loaded-pdf-path ""))
       (set-message "Error: No PDF loaded. Use 'Load PDF' first." "AI")
-      (if (or (not ai-claude-api-key) (string=? ai-claude-api-key ""))
-          (set-message "Error: Claude API key not set" "AI")
+      (if (string=? (ai-get-pdf-api-key) "")
+          (set-message (string-append "Error: API key not set for " ai-pdf-provider) "AI")
           (begin
-            (set-message "Asking Claude about PDF (please wait)..." "AI")
+            (set-message (string-append "Asking " ai-pdf-provider " about PDF (please wait)...") "AI")
             (let* ((helper-src (string-append (getenv "HOME")
                                  "/Library/Application Support/moganlab/plugins/ai/bin/ai-helper.py"))
                    (helper-src-linux (string-append (getenv "HOME")
@@ -601,10 +620,10 @@
                    (script-file "/tmp/mogan-ai-pdf-query.sh")
                    (output-file "/tmp/mogan-ai-pdf-output.txt"))
               (string-save
-               (string-append "{\"provider\":\"claude\""
+               (string-append "{\"provider\":\"" ai-pdf-provider "\""
                               ",\"question\":\"" (json-escape-string question) "\""
                               ",\"pdf_path\":\"" (json-escape-string ai-loaded-pdf-path) "\""
-                              ",\"api_key\":\"" ai-claude-api-key "\""
+                              ",\"api_key\":\"" (ai-get-pdf-api-key) "\""
                               "}")
                (unix->url config-file))
               (string-save
@@ -642,74 +661,138 @@
 ;; PDF to LaTeX conversion
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
+(define ai-conversion-pid-file "/tmp/mogan-ai-convert.pid")
+
+(define (ai-run-pdf-conversion question tex-file . opt-max-tokens)
+  ;; Common conversion logic shared by full and continue conversion
+  ;; Blocking call - Mogan shows pinwheel while waiting
+  ;; To cancel from Terminal: kill $(cat /tmp/mogan-ai-convert.pid)
+  (let* ((max-tokens (if (null? opt-max-tokens) 8192 (car opt-max-tokens)))
+         (helper-src (string-append (getenv "HOME")
+                       "/Library/Application Support/moganlab/plugins/ai/bin/ai-helper.py"))
+         (helper-src-linux (string-append (getenv "HOME")
+                             "/.TeXmacs/plugins/ai/bin/ai-helper.py"))
+         (config-file "/tmp/mogan-ai-pdf-config.json")
+         (script-file "/tmp/mogan-ai-pdf-convert.sh")
+         (json-output "/tmp/mogan-ai-pdf-convert-output.txt")
+         (status-file "/tmp/mogan-ai-convert-status.txt"))
+    (string-save
+     (string-append "{\"provider\":\"" ai-pdf-provider "\""
+                    ",\"question\":\"" (json-escape-string question) "\""
+                    ",\"pdf_path\":\"" (json-escape-string ai-loaded-pdf-path) "\""
+                    ",\"api_key\":\"" (ai-get-pdf-api-key) "\""
+                    ",\"max_tokens\":" (number->string max-tokens)
+                    "}")
+     (unix->url config-file))
+    (string-save
+     (string-append "#!/bin/bash\n"
+       "rm -f '" json-output "' '" tex-file "' '" status-file "'\n"
+       "HELPER=\"" helper-src "\"\n"
+       "if [ ! -f \"$HELPER\" ]; then\n"
+       "  HELPER=\"" helper-src-linux "\"\n"
+       "fi\n"
+       "CONFIG=$(cat '" config-file "')\n"
+       "# Write PID for cancel from Terminal: kill $(cat " ai-conversion-pid-file ")\n"
+       "echo $$ > " ai-conversion-pid-file "\n"
+       "python3 \"$HELPER\" \"$CONFIG\" > '" json-output "' 2>&1\n"
+       "python3 -c '\n"
+       "import json, re\n"
+       "with open(\"" json-output "\", encoding=\"utf-8\") as f:\n"
+       "    data = json.load(f)\n"
+       "if data.get(\"success\") and \"answer\" in data:\n"
+       "    text = data[\"answer\"]\n"
+       "    text = text.replace(\"**\", \"\")\n"
+       "    text = re.sub(r\"(?<=[A-Za-z])\\*(?=[A-Za-z])\", \"\", text)\n"
+       "    text = re.sub(r\"\\\\usepackage(\\[.*?\\])?\\{geometry\\}\", \"\", text)\n"
+       "    text = re.sub(r\"\\\\geometry\\{.*?\\}\", \"\", text)\n"
+       "    margin_settings = (\n"
+       "        \"\\\\setlength{\\\\oddsidemargin}{0pt}\\n\"\n"
+       "        \"\\\\setlength{\\\\evensidemargin}{0pt}\\n\"\n"
+       "        \"\\\\setlength{\\\\textwidth}{6.5in}\\n\"\n"
+       "        \"\\\\setlength{\\\\topmargin}{0pt}\\n\"\n"
+       "        \"\\\\setlength{\\\\textheight}{9in}\\n\"\n"
+       "    )\n"
+       "    text = text.replace(\"\\\\begin{document}\", margin_settings + \"\\\\begin{document}\")\n"
+       "    with open(\"" tex-file "\", \"w\", encoding=\"utf-8\") as f:\n"
+       "        f.write(text)\n"
+       "    if data.get(\"truncated\"):\n"
+       "        print(\"TRUNCATED\")\n"
+       "    else:\n"
+       "        print(\"OK\")\n"
+       "else:\n"
+       "    print(data.get(\"error\", \"Unknown error\"))\n"
+       "' > '" status-file "' 2>&1\n"
+       "rm -f " ai-conversion-pid-file "\n"
+       "sync\n")
+     (unix->url script-file))
+    ;; Blocking call - Mogan shows pinwheel
+    (system (string-append "/bin/bash " script-file))
+    (system "sleep 0.1")
+    ;; Show result immediately
+    (let ((status (var-eval-system (string-append "cat '" status-file "' 2>/dev/null"))))
+      (cond
+        ((and status (>= (string-search-forwards "OK" 0 status) 0)
+              (not (>= (string-search-forwards "TRUNCATED" 0 status) 0)))
+         (set-message (string-append "LaTeX saved to " tex-file) "AI")
+         (load-buffer (unix->url tex-file))
+         (init-env "page-type" "a4")
+         (init-env "page-screen-margin" "false")
+         (init-env "page-odd" "1in")
+         (init-env "page-even" "1in")
+         (init-env "page-right" "1in")
+         (init-env "page-top" "1in")
+         (init-env "page-bot" "1in"))
+        ((and status (>= (string-search-forwards "TRUNCATED" 0 status) 0))
+         (set-message "Warning: Output truncated. Use 'Continue PDF conversion' for the rest." "AI")
+         (load-buffer (unix->url tex-file))
+         (init-env "page-type" "a4")
+         (init-env "page-screen-margin" "false")
+         (init-env "page-odd" "1in")
+         (init-env "page-even" "1in")
+         (init-env "page-right" "1in")
+         (init-env "page-top" "1in")
+         (init-env "page-bot" "1in"))
+        (else
+         (set-message (string-append "Conversion failed: " (or status "Unknown error")) "AI")
+         (ai-write-scratch "PDF Conversion"
+           (string-append "Conversion failed.\n\n"
+             "Error: " (or status "Unknown") "\n\n"
+             "To cancel a running conversion from Terminal:\n"
+             "  kill $(cat /tmp/mogan-ai-convert.pid)")))))))
 (define (ai-convert-pdf-to-latex)
   (if (or (not ai-loaded-pdf-path) (string=? ai-loaded-pdf-path ""))
       (set-message "Error: No PDF loaded. Use 'Load PDF' first." "AI")
-      (if (or (not ai-claude-api-key) (string=? ai-claude-api-key ""))
-          (set-message "Error: Claude API key not set" "AI")
+      (if (string=? (ai-get-pdf-api-key) "")
+          (set-message (string-append "Error: API key not set for " ai-pdf-provider) "AI")
           (begin
-            (set-message "Converting PDF to LaTeX (this may take several minutes)..." "AI")
-            (let* ((helper-src (string-append (getenv "HOME")
-                                 "/Library/Application Support/moganlab/plugins/ai/bin/ai-helper.py"))
-                   (helper-src-linux (string-append (getenv "HOME")
-                                       "/.TeXmacs/plugins/ai/bin/ai-helper.py"))
-                   (config-file "/tmp/mogan-ai-pdf-config.json")
-                   (script-file "/tmp/mogan-ai-pdf-convert.sh")
-                   (json-output "/tmp/mogan-ai-pdf-convert-output.txt")
-                   (tex-file "/tmp/PDF-to-LaTeX.tex")
-                   (status-file "/tmp/mogan-ai-convert-status.txt")
-                   (question "Convert this entire PDF document to LaTeX source code. Reproduce ALL content as faithfully as possible including: text, section structure, equations, tables, theorem environments, references, and formatting. For charts and figures, describe them in comments. Output ONLY the LaTeX code starting from \\documentclass, with no explanation before or after. Use appropriate packages (amsmath, amssymb, amsthm, etc). Include \\usepackage[utf8]{inputenc} for proper encoding."))
-              (string-save
-               (string-append "{\"provider\":\"claude\""
-                              ",\"question\":\"" (json-escape-string question) "\""
-                              ",\"pdf_path\":\"" (json-escape-string ai-loaded-pdf-path) "\""
-                              ",\"api_key\":\"" ai-claude-api-key "\""
-                              "}")
-               (unix->url config-file))
-              (string-save
-               (string-append "#!/bin/bash\n"
-                 "rm -f " json-output " " tex-file " " status-file "\n"
-                 "HELPER=\"" helper-src "\"\n"
-                 "if [ ! -f \"$HELPER\" ]; then\n"
-                 "  HELPER=\"" helper-src-linux "\"\n"
-                 "fi\n"
-                 "CONFIG=$(cat " config-file ")\n"
-                 "python3 \"$HELPER\" \"$CONFIG\" > " json-output " 2>&1\n"
-                 "python3 -c '\n"
-                 "import json, re\n"
-                 "with open(\"" json-output "\", encoding=\"utf-8\") as f:\n"
-                 "    data = json.load(f)\n"
-                 "if data.get(\"success\") and \"answer\" in data:\n"
-                 "    text = data[\"answer\"]\n"
-                 "    text = text.replace(\"**\", \"\")\n"
-                 "    text = re.sub(r\"(?<=[A-Za-z])\\*(?=[A-Za-z])\", \"\", text)\n"
-                 "    with open(\"" tex-file "\", \"w\", encoding=\"utf-8\") as f:\n"
-                 "        f.write(text)\n"
-                 "    if data.get(\"truncated\"):\n"
-                 "        print(\"TRUNCATED\")\n"
-                 "    else:\n"
-                 "        print(\"OK\")\n"
-                 "else:\n"
-                 "    print(data.get(\"error\", \"Unknown error\"))\n"
-                 "' > " status-file " 2>&1\n"
-                 "sync\n")
-               (unix->url script-file))
-              (system (string-append "/bin/bash " script-file))
-              (system "sleep 0.1")
-              (let ((status (var-eval-system (string-append "cat " status-file))))
-                (if (and status (string=? status "OK"))
-                    (begin
-                      (set-message (string-append "LaTeX saved to " tex-file) "AI")
-                      (load-buffer (unix->url tex-file)))
-                    (if (and status (string=? status "TRUNCATED"))
-                        (begin
-                          (set-message "Warning: Output truncated due to document size. LaTeX file is incomplete." "AI")
-                          (load-buffer (unix->url tex-file)))
-                        (set-message (string-append "Conversion error: " (or status "Unknown")) "AI")))))))))
+            (set-message (string-append "Converting PDF to LaTeX using " ai-pdf-provider " (this may take several minutes)...") "AI")
+            (ai-run-pdf-conversion
+             "Recreate this PDF as LaTeX source code. Output ONLY LaTeX code from \\documentclass to \\end{document}. Include all text, equations, theorems, tables, and references. Use \\documentclass[10pt]{article}. Use amsmath, amssymb, amsthm packages. Do NOT use \\title{}, \\author{}, \\maketitle, or \\begin{abstract}. Format title as \\begin{center}{\\LARGE\\textbf{Title}}\\end{center}. Format abstract as \\noindent\\textbf{Abstract.} text. Do NOT use geometry package. Describe figures in comments."
+             "/tmp/PDF-to-LaTeX.tex"
+             8192)))))
+
+(define (ai-continue-pdf-conversion last-text)
+  (if (or (not ai-loaded-pdf-path) (string=? ai-loaded-pdf-path ""))
+      (set-message "Error: No PDF loaded. Use 'Load PDF' first." "AI")
+      (if (string=? (ai-get-pdf-api-key) "")
+          (set-message (string-append "Error: API key not set for " ai-pdf-provider) "AI")
+          (begin
+            (set-message "Continuing conversion (this may take several minutes)..." "AI")
+            (ai-run-pdf-conversion
+             (string-append "Recreate this PDF as LaTeX code. The previous conversion ended near: \"" last-text "\". Start from IMMEDIATELY AFTER that point. Output ONLY LaTeX body content, no preamble, no \\documentclass, no \\begin{document}, no \\end{document}. Include all text, equations, theorems, tables, and references. Describe figures in comments.")
+             "/tmp/PDF-to-LaTeX-continued.tex"
+             8192)))))
 
 (tm-define (ai-convert-pdf-interactive)
   (:synopsis "Convert loaded PDF to LaTeX")
   (ai-convert-pdf-to-latex))
+
+(tm-define (ai-continue-pdf-interactive)
+  (:synopsis "Continue PDF to LaTeX conversion from where it stopped")
+  (interactive (lambda (p)
+    (when (and p (> (string-length p) 0))
+      (ai-continue-pdf-conversion p)))
+    (list "Last converted text (a few words)" "string" '())))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Menu
@@ -725,6 +808,20 @@
   ("Load PDF..." (ai-load-pdf-interactive))
   ("Ask about PDF..." (ai-ask-pdf-interactive))
   ("Convert PDF to LaTeX" (ai-convert-pdf-interactive))
+  ("Continue PDF conversion..." (ai-continue-pdf-interactive))
+  (=> "PDF Provider"
+    ("Use Claude"
+     (begin (set! ai-pdf-provider "claude")
+            (set-message "PDF provider: Claude" "AI")))
+    ("Use OpenAI (GPT-4o)"
+     (begin (set! ai-pdf-provider "openai")
+            (set-message "PDF provider: OpenAI" "AI")))
+    ("Use Gemini"
+     (begin (set! ai-pdf-provider "gemini")
+            (set-message "PDF provider: Gemini" "AI")))
+    ("Use Grok"
+     (begin (set! ai-pdf-provider "grok")
+            (set-message "PDF provider: Grok" "AI"))))
   ---
   ("Help with Mogan..." (ai-help-mogan-interactive))
   ---

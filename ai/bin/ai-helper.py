@@ -42,7 +42,7 @@ def pick_file():
         return {'success': False, 'error': str(e)}
 
 
-def call_claude(question, pdf_path=None, api_key=None):
+def call_claude(question, pdf_path=None, api_key=None, max_tokens=16384):
     """Call Claude API with optional PDF document."""
     import requests
 
@@ -76,7 +76,7 @@ def call_claude(question, pdf_path=None, api_key=None):
 
     data = {
         'model': 'claude-sonnet-4-20250514',
-        'max_tokens': 16384,
+        'max_tokens': max_tokens,
         'system': (
             'Your response will be rendered in a LaTeX document. '
             'You MUST follow these rules strictly:\n'
@@ -107,10 +107,220 @@ def call_claude(question, pdf_path=None, api_key=None):
         raise ValueError("No content in Claude response")
 
 
-def call_gemini(question, pdf_path=None, api_key=None):
-    """Call Gemini API with optional PDF document."""
-    # TODO: Add Gemini support
-    return 'Gemini support coming soon'
+def call_openai(question, pdf_path=None, api_key=None, max_tokens=16384):
+    """Call OpenAI API (GPT-4o) with optional PDF document."""
+    import requests
+
+    if not api_key:
+        raise ValueError("OpenAI API key is required")
+
+    url = 'https://api.openai.com/v1/chat/completions'
+    headers = {
+        'Authorization': f'Bearer {api_key}',
+        'Content-Type': 'application/json'
+    }
+
+    content = []
+
+    # Add PDF as images (OpenAI doesn't support PDF directly, convert pages)
+    if pdf_path and os.path.exists(pdf_path):
+        # Try to send PDF as base64 file for models that support it
+        # GPT-4o supports images, so we convert PDF pages to images
+        try:
+            import subprocess
+            import tempfile
+            import glob
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                # Use sips on macOS or convert PDF to PNG pages
+                # First try pdftoppm if available
+                result = subprocess.run(
+                    ['which', 'pdftoppm'], capture_output=True, text=True
+                )
+                if result.returncode == 0:
+                    subprocess.run(
+                        ['pdftoppm', '-png', '-r', '150', pdf_path, os.path.join(tmpdir, 'page')],
+                        capture_output=True, timeout=60
+                    )
+                else:
+                    # Use sips on macOS - convert PDF to PNG
+                    subprocess.run(
+                        ['sips', '-s', 'format', 'png', pdf_path, '--out', os.path.join(tmpdir, 'page.png')],
+                        capture_output=True, timeout=60
+                    )
+
+                # Collect all page images
+                pages = sorted(glob.glob(os.path.join(tmpdir, 'page*.png')))
+                for page_path in pages:
+                    with open(page_path, 'rb') as f:
+                        img_b64 = base64.b64encode(f.read()).decode('utf-8')
+                    content.append({
+                        'type': 'image_url',
+                        'image_url': {
+                            'url': f'data:image/png;base64,{img_b64}',
+                            'detail': 'high'
+                        }
+                    })
+        except Exception:
+            # If image conversion fails, send as text extraction
+            pass
+
+    # Add the question text
+    content.append({'type': 'text', 'text': question})
+
+    system_msg = (
+        'Your response will be rendered in a LaTeX document. '
+        'Use LaTeX formatting ONLY. NEVER use markdown syntax. '
+        'For bold use \\textbf{}, for math use $...$ or \\begin{equation}. '
+        'NEVER use asterisks for formatting. '
+        'Write plain author names without formatting characters between letters.'
+    )
+
+    data = {
+        'model': 'gpt-4o',
+        'max_tokens': max_tokens,
+        'messages': [
+            {'role': 'system', 'content': system_msg},
+            {'role': 'user', 'content': content}
+        ]
+    }
+
+    response = requests.post(url, headers=headers, json=data, timeout=600)
+    response.raise_for_status()
+
+    result = response.json()
+    if 'choices' in result and len(result['choices']) > 0:
+        text = result['choices'][0]['message']['content']
+        truncated = result['choices'][0].get('finish_reason') == 'length'
+        return text, truncated
+    else:
+        raise ValueError("No content in OpenAI response")
+
+
+def call_grok(question, pdf_path=None, api_key=None, max_tokens=16384):
+    """Call xAI Grok API with optional PDF document via Files API."""
+    import requests
+
+    if not api_key:
+        raise ValueError("Grok API key is required")
+
+    base_url = 'https://api.x.ai/v1'
+    auth_header = {'Authorization': f'Bearer {api_key}'}
+
+    file_ids = []
+
+    # Upload PDF via Files API if provided
+    if pdf_path and os.path.exists(pdf_path):
+        upload_resp = requests.post(
+            f'{base_url}/files',
+            headers=auth_header,
+            files={'file': (os.path.basename(pdf_path), open(pdf_path, 'rb'), 'application/pdf')},
+            data={'purpose': 'assistants'},
+            timeout=120
+        )
+        upload_resp.raise_for_status()
+        file_id = upload_resp.json().get('id')
+        if file_id:
+            file_ids.append(file_id)
+
+    system_msg = (
+        'Your response will be rendered in a LaTeX document. '
+        'Use LaTeX formatting ONLY. NEVER use markdown syntax. '
+        'For bold use \\textbf{}, for math use $...$ or \\begin{equation}. '
+        'NEVER use asterisks for formatting. '
+        'Write plain author names without formatting characters between letters.'
+    )
+
+    # Build input with file attachments
+    user_content = []
+    for fid in file_ids:
+        user_content.append({'type': 'file', 'file_id': fid})
+    user_content.append({'type': 'text', 'text': question})
+
+    # Use Responses API for file support
+    data = {
+        'model': 'grok-3-fast',
+        'max_output_tokens': max_tokens,
+        'input': [
+            {'role': 'system', 'content': system_msg},
+            {'role': 'user', 'content': user_content}
+        ]
+    }
+
+    headers = {**auth_header, 'Content-Type': 'application/json'}
+    response = requests.post(f'{base_url}/responses', headers=headers, json=data, timeout=600)
+    response.raise_for_status()
+
+    result = response.json()
+
+    # Extract text from Responses API output
+    text = ''
+    truncated = False
+    if 'output' in result:
+        for item in result['output']:
+            if item.get('type') == 'message':
+                for content in item.get('content', []):
+                    if content.get('type') == 'output_text':
+                        text += content.get('text', '')
+        truncated = result.get('status') == 'incomplete'
+    
+    if not text:
+        raise ValueError("No content in Grok response")
+
+    return text, truncated
+
+
+def call_gemini(question, pdf_path=None, api_key=None, max_tokens=16384):
+    """Call Google Gemini API with optional PDF document."""
+    import requests
+
+    if not api_key:
+        raise ValueError("Gemini API key is required")
+
+    url = f'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key={api_key}'
+
+    content_parts = []
+
+    # Add PDF document if provided
+    if pdf_path and os.path.exists(pdf_path):
+        with open(pdf_path, 'rb') as f:
+            pdf_b64 = base64.b64encode(f.read()).decode('utf-8')
+        content_parts.append({
+            'inline_data': {
+                'mime_type': 'application/pdf',
+                'data': pdf_b64
+            }
+        })
+
+    # Add the question text
+    content_parts.append({'text': question})
+
+    data = {
+        'contents': [{'parts': content_parts}],
+        'systemInstruction': {
+            'parts': [{'text': (
+                'Your response will be rendered in a LaTeX document. '
+                'Use LaTeX formatting ONLY. NEVER use markdown syntax. '
+                'For bold use \\textbf{}, for math use $...$ or \\begin{equation}. '
+                'NEVER use asterisks for formatting.'
+            )}]
+        },
+        'generationConfig': {
+            'maxOutputTokens': max_tokens
+        }
+    }
+
+    response = requests.post(url, headers={'Content-Type': 'application/json'}, json=data, timeout=600)
+    response.raise_for_status()
+
+    result = response.json()
+    if 'candidates' in result and len(result['candidates']) > 0:
+        candidate = result['candidates'][0]
+        text = candidate['content']['parts'][0]['text']
+        truncated = candidate.get('finishReason') == 'MAX_TOKENS'
+        return text, truncated
+    else:
+        raise ValueError("No content in Gemini response")
 
 
 def main():
@@ -136,16 +346,20 @@ def main():
         question = config.get('question')
         pdf_path = config.get('pdf_path')
         api_key = config.get('api_key')
+        max_tokens = config.get('max_tokens', 16384)
 
         if not question:
             raise ValueError("Question is required")
 
         # Call appropriate provider
         if provider == 'claude':
-            answer, truncated = call_claude(question, pdf_path, api_key)
+            answer, truncated = call_claude(question, pdf_path, api_key, max_tokens)
+        elif provider == 'openai':
+            answer, truncated = call_openai(question, pdf_path, api_key, max_tokens)
+        elif provider == 'grok':
+            answer, truncated = call_grok(question, pdf_path, api_key, max_tokens)
         elif provider == 'gemini':
-            answer = call_gemini(question, pdf_path, api_key)
-            truncated = False
+            answer, truncated = call_gemini(question, pdf_path, api_key, max_tokens)
         else:
             raise ValueError(f'Unknown provider: {provider}')
 
